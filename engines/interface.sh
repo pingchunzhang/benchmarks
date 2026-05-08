@@ -191,6 +191,105 @@ xml_escape() {
                           -e "s/'/\&apos;/g"
 }
 
+# Common load helpers for engines that use the MySQL protocol and SHOW LOAD,
+# such as Doris and StarRocks. Engines opt in by wrapping mysql_engine_load_data.
+mysql_engine_check_load_status() {
+    local label="$1"
+    local host="${fe_host:-127.0.0.1}"
+    local port="${fe_query_port:-9030}"
+    local sys_user="${user:-root}"
+
+    MYSQL_PWD="${password:-}" mysql -h"${host}" -P"${port}" -u"${sys_user}" "${db}" \
+        -e "SHOW LOAD WHERE Label = '${label}'\\G" 2>/dev/null
+}
+
+mysql_engine_load_data() {
+    local detected_method="$1"
+    local load_file="$2"
+    local table_name="$3"
+    local load_output=""
+
+    if [[ "$detected_method" == "stream_load" ]]; then
+        if load_output=$(bash "$load_file" 2>&1); then
+            echo "$load_output"
+        else
+            echo "$load_output" >&2
+            echo "ERROR: Failed to execute load script: $load_file" >&2
+            return 1
+        fi
+    elif [[ "$detected_method" == "s3_load" ]]; then
+        # S3 Broker Load is async - submit then poll SHOW LOAD
+        local tmp_sql
+        create_temp_sql_file "load_${table_name}"
+        tmp_sql="$LAST_TEMP_FILE"
+        envsubst < "$load_file" > "$tmp_sql"
+
+        if ! engine_run_sql_file "$tmp_sql"; then
+            rm -f "$tmp_sql"
+            echo "ERROR: Failed to submit S3 load: $load_file" >&2
+            return 1
+        fi
+        rm -f "$tmp_sql"
+
+        local load_label="${table_name}_${TIMESTAMP}"
+        echo "    Waiting for S3 load to complete (label: $load_label)..."
+
+        local max_wait=36000
+        local waited=0
+        while [ $waited -lt $max_wait ]; do
+            sleep 10
+            waited=$((waited + 10))
+
+            local status_output
+            status_output=$(mysql_engine_check_load_status "$load_label")
+
+            # Fail fast when the load label cannot be found.
+            if [ -z "$(echo "$status_output" | tr -d '[:space:]')" ] || \
+               echo "$status_output" | grep -qi "Empty set"; then
+                echo "$status_output"
+                echo "ERROR: S3 load label not found: $load_label" >&2
+                return 1
+            fi
+
+            if echo "$status_output" | grep -q "FINISHED"; then
+                echo "    S3 load completed successfully"
+                break
+            elif echo "$status_output" | grep -q "CANCELLED"; then
+                echo "$status_output"
+                echo "ERROR: S3 load cancelled" >&2
+                return 1
+            fi
+
+            # Print progress every minute
+            if [ $((waited % 60)) -eq 0 ]; then
+                local progress
+                progress=$(echo "$status_output" | awk -F': ' '/Progress:/{print $2; exit}')
+                echo "    [$waited s] Progress: ${progress:-unknown}"
+            fi
+        done
+
+        if [ $waited -ge $max_wait ]; then
+            echo "ERROR: S3 load timeout after ${max_wait}s" >&2
+            return 1
+        fi
+    elif [[ "$detected_method" == "insert_into" ]]; then
+        local tmp_sql
+        create_temp_sql_file "load_${table_name}"
+        tmp_sql="$LAST_TEMP_FILE"
+        envsubst < "$load_file" > "$tmp_sql"
+
+        if ! engine_run_sql_file "$tmp_sql"; then
+            rm -f "$tmp_sql"
+            echo "ERROR: Failed to execute load SQL file: $load_file" >&2
+            return 1
+        fi
+        rm -f "$tmp_sql"
+    else
+        echo "ERROR: Unknown load method: $detected_method" >&2
+        return 1
+    fi
+}
+
 # Validation function to check if an engine implements all required functions
 # This can be called by benchmark.sh to validate engine compatibility
 validate_engine() {

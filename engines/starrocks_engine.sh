@@ -164,6 +164,12 @@ engine_get_table_rows() {
 
     return 0
 }
+
+# Optional: Custom generic load implementation for StarRocks
+engine_load_data() {
+    mysql_engine_load_data "$@"
+}
+
 engine_set_auto_analyze() {
     local enabled="$1"
     local collect="false"
